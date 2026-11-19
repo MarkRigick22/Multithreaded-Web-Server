@@ -186,4 +186,3 @@ void set_log_debug_sleep(server_log log, int seconds)
     log->debug_sleep_seconds = (seconds > 0) ? seconds : 0;
     pthread_mutex_unlock(&log->mtx);
 }
-
