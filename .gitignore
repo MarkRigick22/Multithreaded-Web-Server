@@ -1,0 +1,10 @@
+*.o
+*.d
+*.dSYM/
+server
+client
+output.cgi
+public/
+__pycache__/
+.DS_Store
+tests/monitor
