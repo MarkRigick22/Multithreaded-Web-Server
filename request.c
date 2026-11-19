@@ -1,267 +1,191 @@
-#include "segel.h"
 #include "request.h"
-#include "log.h"
+#include <limits.h>
+#include <spawn.h>
 
-/*
- * NOTE: This request.c assumes log.h/log.c expose these helpers:
- *   void log_read_lock(server_log log);
- *   void log_read_unlock(server_log log);
- *   void log_write_lock(server_log log);
- *   void log_write_unlock(server_log log);
- *   void log_writer_debug_sleep(server_log log);          // sleep INSIDE writer CS if debug enabled
- *   int  get_log_locked(server_log log, char** dst);      // assumes read lock held
- *   void add_to_log_locked(server_log log, const char* data, int data_len); // assumes write lock held
- */
-
-int append_stats(char* buf, threads_stats t_stats, time_stats tm_stats) {
-    int offset = strlen(buf);
-
-    offset += sprintf(buf + offset, "Stat-Req-Arrival:: %ld.%06ld\r\n",
-                      tm_stats.task_arrival.tv_sec, tm_stats.task_arrival.tv_usec);
-    offset += sprintf(buf + offset, "Stat-Req-Dispatch:: %ld.%06ld\r\n",
-                      tm_stats.task_dispatch.tv_sec, tm_stats.task_dispatch.tv_usec);
-    offset += sprintf(buf + offset, "Stat-Log-Arrival:: %ld.%06ld\r\n",
-                      tm_stats.log_enter.tv_sec, tm_stats.log_enter.tv_usec);
-    offset += sprintf(buf + offset, "Stat-Log-Dispatch:: %ld.%06ld\r\n",
-                      tm_stats.log_exit.tv_sec, tm_stats.log_exit.tv_usec);
-
-    offset += sprintf(buf + offset, "Stat-Thread-Id:: %d\r\n", t_stats->id);
-    offset += sprintf(buf + offset, "Stat-Thread-Count:: %d\r\n", t_stats->total_req);
-    offset += sprintf(buf + offset, "Stat-Thread-Static:: %d\r\n", t_stats->stat_req);
-    offset += sprintf(buf + offset, "Stat-Thread-Dynamic:: %d\r\n", t_stats->dynm_req);
-    offset += sprintf(buf + offset, "Stat-Thread-Post:: %d\r\n\r\n", t_stats->post_req);
-    return offset;
-}
-
-static void requestError(int fd, char *cause, char *errnum, char *shortmsg, char *longmsg,
-                         time_stats tm_stats, threads_stats t_stats)
+// The assignment uses a literal second colon at the start of each Stat value.
+static int format_stats(char *buf, size_t size, threads_stats t, time_stats tm)
 {
-    char buf[MAXLINE], body[MAXBUF];
-
-    sprintf(body, "<html><title>OS-HW3 Error</title>");
-    sprintf(body + strlen(body), "<body bgcolor=\"fffff\">\r\n");
-    sprintf(body + strlen(body), "%s: %s\r\n", errnum, shortmsg);
-    sprintf(body + strlen(body), "<p>%s: %s\r\n", longmsg, cause);
-    sprintf(body + strlen(body), "<hr>OS-HW3 Web Server\r\n");
-
-    sprintf(buf, "HTTP/1.0 %s %s\r\n", errnum, shortmsg);
-    sprintf(buf + strlen(buf), "Content-Type: text/html\r\n");
-    sprintf(buf + strlen(buf), "Content-Length: %lu\r\n", strlen(body));
-
-    int buf_len = append_stats(buf, t_stats, tm_stats);
-
-    Rio_writen(fd, buf, buf_len);
-    Rio_writen(fd, body, strlen(body));
+    int n = snprintf(buf, size,
+        "Stat-Req-Arrival:: %ld.%06ld\r\nStat-Req-Dispatch:: %ld.%06ld\r\n"
+        "Stat-Log-Arrival:: %ld.%06ld\r\nStat-Log-Dispatch:: %ld.%06ld\r\n"
+        "Stat-Thread-Id:: %d\r\nStat-Thread-Count:: %" PRIu64 "\r\n"
+        "Stat-Thread-Static:: %" PRIu64 "\r\nStat-Thread-Dynamic:: %" PRIu64 "\r\n"
+        "Stat-Thread-Post:: %" PRIu64 "\r\n\r\n",
+        (long)tm.task_arrival.tv_sec, (long)tm.task_arrival.tv_usec,
+        (long)tm.task_dispatch.tv_sec, (long)tm.task_dispatch.tv_usec,
+        (long)tm.log_enter.tv_sec, (long)tm.log_enter.tv_usec,
+        (long)tm.log_exit.tv_sec, (long)tm.log_exit.tv_usec,
+        t->id, t->total_req, t->stat_req, t->dynm_req, t->post_req);
+    return n >= 0 && (size_t)n < size ? n : -1;
 }
 
-static void requestReadhdrs(rio_t *rp)
+static int send_headers(int fd, const char *status, const char *type, const char *stats,
+                    size_t length)
 {
-    char buf[MAXLINE];
-    Rio_readlineb(rp, buf, MAXLINE);
-    while (strcmp(buf, "\r\n")) {
-        Rio_readlineb(rp, buf, MAXLINE);
-    }
+    char header[2048];
+    int n = snprintf(header, sizeof header,
+        "HTTP/1.0 %s\r\nServer: OS-HW3 Web Server\r\nContent-Length: %zu\r\n"
+        "Content-Type: %s\r\nConnection: close\r\n%s", status, length, type, stats);
+    return n > 0 && (size_t)n < sizeof header && rio_writen(fd, header, n) == n;
 }
 
-static int requestParseURI(char *uri, char *filename, char *cgiargs)
+// Consume bounded CRLF-terminated headers. EOF is terminal even mid-request.
+static int read_headers(rio_t *rio)
 {
-    char *ptr;
-    if (strstr(uri, "..")) {
-        sprintf(filename, "./public/home.html");
-        return 1;
+    char line[MAXLINE];
+    for (unsigned count = 0; count < 128; ++count) {
+        ssize_t n = rio_readlineb(rio, line, sizeof line);
+        if (n < 2 || memchr(line, 0, (size_t)n) || strcmp(line + n - 2, "\r\n"))
+            return -1;
+        if (n == 2) return 0;
+        char *colon = strchr(line, ':');
+        if (!colon || colon == line) return -1;
+        for (char *p = line; p < colon; ++p)
+            if (!isalnum((unsigned char)*p) && !strchr("!#$%&'*+-.^_`|~", *p)) return -1;
     }
-    if (!strstr(uri, "cgi")) {
-        strcpy(cgiargs, "");
-        sprintf(filename, "./public/%s", uri);
-        if (uri[strlen(uri)-1] == '/') strcat(filename, "home.html");
-        return 1;
-    } else {
-        ptr = index(uri, '?');
-        if (ptr) {
-            strcpy(cgiargs, ptr+1);
-            *ptr = '\0';
-        } else {
-            strcpy(cgiargs, "");
-        }
-        sprintf(filename, "./public/%s", uri);
-        return 0;
-    }
+    return -1;
 }
 
-static void requestGetFiletype(char *filename, char *filetype)
+static const char *filetype(const char *name)
 {
-    if (strstr(filename, ".html")) strcpy(filetype, "text/html");
-    else if (strstr(filename, ".gif")) strcpy(filetype, "image/gif");
-    else if (strstr(filename, ".jpg")) strcpy(filetype, "image/jpeg");
-    else strcpy(filetype, "text/plain");
+    const char *ext = strrchr(name, '.');
+    if (!ext) return "text/plain";
+    if (!strcmp(ext, ".html")) return "text/html";
+    if (!strcmp(ext, ".gif")) return "image/gif";
+    if (!strcmp(ext, ".jpg")) return "image/jpeg";
+    return "text/plain";
 }
 
-static char* requestPrepareDynamic(char *filename, char *cgiargs, int *out_len) {
-    char *emptylist[] = {NULL};
-    int p[2];
-    if (pipe(p) < 0) return NULL;
-
-    pid_t pid = Fork();
-    if (pid == 0) {
-        Close(p[0]);
-        Setenv("QUERY_STRING", cgiargs, 1);
-        Dup2(p[1], STDOUT_FILENO);
-        Execve(filename, emptylist, environ);
-        exit(0);
-    }
-
-    Close(p[1]);
-    char *body = malloc(MAXBUF);
-    int total_read = 0, n;
-
-    while ((n = Rio_readn(p[0], body + total_read, MAXBUF - total_read)) > 0) {
-        total_read += n;
-        if (total_read == MAXBUF) break;
-    }
-
-    WaitPid(pid, NULL, 0);
-    Close(p[0]);
-
-    *out_len = total_read;
-    return body;
-}
-
-static void* requestPrepareStatic(char *filename, int filesize)
+// Use a temporary output descriptor so CGI output cannot fill a pipe while
+// its parent waits. Only programs installed by the operator belong in public/.
+static FILE *run_cgi(const char *path, const char *query)
 {
-    int srcfd = Open(filename, O_RDONLY, 0);
-    char *body = malloc(filesize);
-    if (body) {
-        Rio_readn(srcfd, body, filesize);
+    char env_query[MAXLINE + sizeof "QUERY_STRING="];
+    snprintf(env_query, sizeof env_query, "QUERY_STRING=%s", query);
+    char *env[] = {env_query, "PATH=/usr/bin:/bin", NULL};
+    char *args[] = {(char *)path, NULL};
+    FILE *out = tmpfile();
+    if (!out) return NULL;
+    posix_spawn_file_actions_t actions;
+    int err = posix_spawn_file_actions_init(&actions);
+    if (err) goto fail;
+    err = posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", O_RDONLY, 0);
+    if (!err) err = posix_spawn_file_actions_adddup2(&actions, fileno(out), 1);
+    if (!err) err = posix_spawn_file_actions_addopen(&actions, 2, "/dev/null", O_WRONLY, 0);
+    pid_t child;
+#ifdef __APPLE__
+    posix_spawnattr_t attr;
+    if (!err) err = posix_spawnattr_init(&attr);
+    if (!err) {
+        err = posix_spawnattr_setflags(&attr, POSIX_SPAWN_CLOEXEC_DEFAULT);
+        if (!err) err = posix_spawn(&child, path, &actions, &attr, args, env);
+        posix_spawnattr_destroy(&attr);
     }
-    Close(srcfd);
-    return (void*)body;
+#else
+    if (!err) err = posix_spawn_file_actions_addclosefrom_np(&actions, 3);
+    if (!err) err = posix_spawn(&child, path, &actions, NULL, args, env);
+#endif
+    posix_spawn_file_actions_destroy(&actions);
+    if (err) goto fail;
+    int status;
+    while (waitpid(child, &status, 0) < 0) if (errno != EINTR) goto fail;
+    if (!WIFEXITED(status) || WEXITSTATUS(status) || fseek(out, 0, SEEK_SET)) goto fail;
+    return out;
+fail:
+    fclose(out);
+    return NULL;
 }
 
-void requestHandle(int fd, time_stats tm_stats, threads_stats t_stats, server_log log)
+// Keep course routing and the CGI stdout-as-body wire format.
+static const char *prepare_get(char *uri, FILE **src, size_t *length,
+                               const char **type, int *dynamic)
 {
-    int is_static = 0;
-    struct stat sbuf;
-    char buf[MAXLINE], method[MAXLINE], uri[MAXLINE], version[MAXLINE];
-    char filename[MAXLINE], cgiargs[MAXLINE], filetype[MAXLINE];
+    if (strstr(uri, "..")) uri = "/home.html";
+    *dynamic = strstr(uri, "cgi") != NULL;
+    char *query = NULL;
+    if (*dynamic && (query = strchr(uri, '?'))) *query++ = 0;
+    char path[PATH_MAX], resolved[PATH_MAX], root[PATH_MAX];
+    int n = snprintf(path, sizeof path, "public/%s%s", uri,
+                     uri[0] && uri[strlen(uri)-1] == '/' ? "home.html" : "");
+    if (n < 0 || (size_t)n >= sizeof path) return "414 URI Too Long";
+    if (!realpath("public", root) || !realpath(path, resolved))
+        return errno == EACCES ? "403 Forbidden" : "404 Not Found";
+    size_t prefix = strlen(root);
+    if (strncmp(resolved, root, prefix) || resolved[prefix] != '/') return "403 Forbidden";
+    struct stat st;
+    if (stat(resolved, &st)) return "404 Not Found";
+    if (!S_ISREG(st.st_mode) || !(st.st_mode & (*dynamic ? S_IXUSR : S_IRUSR)))
+        return "403 Forbidden";
+    *src = *dynamic ? run_cgi(resolved, query ? query : "") : fopen(resolved, "rb");
+    if (!*src || fstat(fileno(*src), &st) || st.st_size < 0 ||
+        (uintmax_t)st.st_size > SIZE_MAX) return "500 Internal Server Error";
+    *length = (size_t)st.st_size;
+    *type = *dynamic ? "text/html" : filetype(resolved);
+    return NULL;
+}
+
+void requestHandle(int fd, time_stats tm, threads_stats t, server_log log)
+{
     rio_t rio;
-
-    void *body_content = NULL;
-    int body_len = 0;
-    char resp_headers[MAXBUF];
-
-    Rio_readinitb(&rio, fd);
-    if (Rio_readlineb(&rio, buf, MAXLINE) <= 0) {
-        return;
-    }
-    sscanf(buf, "%s %s %s", method, uri, version);
-
-    // ---- counters rule: ALL requests (including errors) increment total ----
-    t_stats->total_req++;
-
-    // Default: if request never touches logger (errors), keep 0 times
-    // (tm_stats.log_enter/log_exit remain 0 unless we set them)
-
-    if (strcasecmp(method, "GET") == 0) {
-        requestReadhdrs(&rio);
-        is_static = requestParseURI(uri, filename, cgiargs);
-
-        if (stat(filename, &sbuf) < 0) {
-            requestError(fd, filename, "404", "Not found",
-                         "OS-HW3 Server could not find this file", tm_stats, t_stats);
-            return;
-        }
-
-        if (is_static) {
-            if (!(S_ISREG(sbuf.st_mode)) || !(S_IRUSR & sbuf.st_mode)) {
-                requestError(fd, filename, "403", "Forbidden",
-                             "OS-HW3 Server could not read this file", tm_stats, t_stats);
-                return;
+    rio_readinitb(&rio, fd);
+    char line[MAXLINE], method[32], uri[MAXLINE], version[16], extra;
+    ssize_t n = rio_readlineb(&rio, line, sizeof line);
+    if (n <= 0) return;
+    ++t->total_req;
+    const char *error = NULL, *type = "text/plain";
+    char stats[1024], *body = NULL;
+    FILE *src = NULL;
+    size_t length = 0;
+    int dynamic = 0;
+    if (n < 2 || memchr(line, 0, (size_t)n) || strcmp(line+n-2, "\r\n") ||
+        sscanf(line, "%31s %8191s %15s %c", method, uri, version, &extra) != 3 ||
+        (strcmp(version, "HTTP/1.0") && strcmp(version, "HTTP/1.1")) || read_headers(&rio))
+        error = "400 Bad Request";
+    else if (!strcasecmp(method, "GET")) {
+        error = prepare_get(uri, &src, &length, &type, &dynamic);
+        if (!error) {
+            uint64_t *counter = dynamic ? &t->dynm_req : &t->stat_req;
+            ++*counter;
+            gettimeofday(&tm.log_enter, NULL);
+            log_write_lock(log);
+            log_debug_sleep(log);
+            // Stamp the commit under exclusive ownership. Log and wire share these bytes.
+            gettimeofday(&tm.log_exit, NULL);
+            int bytes = format_stats(stats, sizeof stats, t, tm);
+            if (bytes < 0 || add_to_log_locked(log, stats, (size_t)bytes)) {
+                --*counter;
+                error = "500 Internal Server Error";
             }
-
-            requestGetFiletype(filename, filetype);
-            body_len = sbuf.st_size;
-            body_content = requestPrepareStatic(filename, body_len);
-
-            sprintf(resp_headers, "HTTP/1.0 200 OK\r\n");
-            sprintf(resp_headers + strlen(resp_headers), "Server: OS-HW3 Web Server\r\n");
-            sprintf(resp_headers + strlen(resp_headers), "Content-Length: %d\r\n", body_len);
-            sprintf(resp_headers + strlen(resp_headers), "Content-Type: %s\r\n", filetype);
-
-            // valid static request -> increment static counter
-            t_stats->stat_req++;
-        } else {
-            if (!(S_ISREG(sbuf.st_mode)) || !(S_IXUSR & sbuf.st_mode)) {
-                requestError(fd, filename, "403", "Forbidden",
-                             "OS-HW3 Server could not run this CGI program", tm_stats, t_stats);
-                return;
-            }
-
-            body_content = requestPrepareDynamic(filename, cgiargs, &body_len);
-
-            sprintf(resp_headers, "HTTP/1.0 200 OK\r\n");
-            sprintf(resp_headers + strlen(resp_headers), "Server: OS-HW3 Web Server\r\n");
-            sprintf(resp_headers + strlen(resp_headers), "Content-Length: %d\r\n", body_len);
-            sprintf(resp_headers + strlen(resp_headers), "Content-Type: text/html\r\n");
-            // valid dynamic request -> increment dynamic counter
-            t_stats->dynm_req++;
+            log_write_unlock(log);
         }
-
-        // ---- GET is a WRITER to the log (writer priority) ----
-        // Stat-Log-Arrival: time request arrived at logger
-        gettimeofday(&tm_stats.log_enter, NULL);
-
-        log_write_lock(log);
-
-        // required debug mode: sleep INSIDE writer CS (handled by logger)
-        log_writer_debug_sleep(log);
-
-        // Stat-Log-Dispatch: when logger finished its blocking/handling phase
-        // (includes debug sleep + waiting on writer lock)
-
-        // log record MUST equal append_stats(empty_buf)
-        char logrec[MAXBUF];
-        logrec[0] = '\0';
-        int logrec_len = append_stats(logrec, t_stats, tm_stats);
-
-        add_to_log_locked(log, logrec, logrec_len);
-        gettimeofday(&tm_stats.log_exit, NULL);   // ✅ move here
-
-
-        log_write_unlock(log);
-
-    } else if (strcasecmp(method, "POST") == 0) {
-        requestReadhdrs(&rio);
-
-        // valid post request -> increment post counter
-        t_stats->post_req++;
-
-        // ---- POST is a READER to the log ----
-        gettimeofday(&tm_stats.log_enter, NULL);
-
+    } else if (!strcasecmp(method, "POST")) {
+        gettimeofday(&tm.log_enter, NULL);
         log_read_lock(log);
-        // after we get access to read, we’ll include the time after copy as "dispatch"
-        body_len = get_log_locked(log, (char**)&body_content);
-        gettimeofday(&tm_stats.log_exit, NULL);
+        log_debug_sleep(log);
+        body = get_log_locked(log, &length);
+        gettimeofday(&tm.log_exit, NULL);
         log_read_unlock(log);
+        if (body) ++t->post_req;
+        else error = "500 Internal Server Error";
+    } else error = "501 Not Implemented";
 
-        sprintf(resp_headers, "HTTP/1.0 200 OK\r\n");
-        sprintf(resp_headers + strlen(resp_headers), "Server: OS-HW3 Web Server\r\n");
-        sprintf(resp_headers + strlen(resp_headers), "Content-Length: %d\r\n", body_len);
-        sprintf(resp_headers + strlen(resp_headers), "Content-Type: text/plain\r\n");
-
-    } else {
-        requestReadhdrs(&rio);
-        requestError(fd, method, "501", "Not Implemented",
-                     "OS-HW3 Server does not implement this method", tm_stats, t_stats);
-        return;
+    if (error) {
+        length = strlen(error);
+        type = "text/plain";
     }
-
-    // ---- SEND ----
-    int total_header_len = append_stats(resp_headers, t_stats, tm_stats);
-    Rio_writen(fd, resp_headers, total_header_len);
-    if (body_len > 0 && body_content) {
-        Rio_writen(fd, body_content, body_len);
+    if (format_stats(stats, sizeof stats, t, tm) >= 0 &&
+        send_headers(fd, error ? error : "200 OK", type, stats, length)) {
+        if (error || body) {
+            (void)rio_writen(fd, error ? (void*)error : body, length);
+        } else {
+            char block[16384];
+            while (length) {
+                size_t count = fread(block, 1, length < sizeof block ? length : sizeof block, src);
+                if (!count || rio_writen(fd, block, count) != (ssize_t)count) break;
+                length -= count;
+            }
+        }
     }
-
-    if (body_content) free(body_content);
+    if (src) fclose(src);
+    free(body);
 }

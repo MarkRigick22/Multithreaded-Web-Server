@@ -48,7 +48,7 @@ typedef struct {
 /* $end rio_t */
 
 /* External variables */
-extern int h_errno;    /* defined by BIND for DNS errors */ 
+/* h_errno is provided by <netdb.h>. */    /* defined by BIND for DNS errors */ 
 extern char **environ; /* defined by libc */
 
 /* Misc constants */

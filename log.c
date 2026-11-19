@@ -1,5 +1,6 @@
 #include "segel.h"
 #include "log.h"
+#include <stdint.h>
 
 struct Server_Log {
     // log storage
@@ -19,19 +20,23 @@ struct Server_Log {
     int debug_sleep_seconds;
 };
 
-static void ensure_capacity(server_log log, size_t need)
+static int ensure_capacity(server_log log, size_t need)
 {
-    if (need <= log->cap) return;
+    if (need <= log->cap) return 0;
 
     size_t newcap = (log->cap == 0) ? 1024 : log->cap;
-    while (newcap < need) newcap *= 2;
+    while (newcap < need) {
+        if (newcap > SIZE_MAX / 2) return -1;
+        newcap *= 2;
+    }
 
     char* nb = (char*)realloc(log->buf, newcap);
     if (!nb) {
-        unix_error("realloc failed in ensure_capacity");
+        return -1;
     }
     log->buf = nb;
     log->cap = newcap;
+    return 0;
 }
 
 /* ---------- internal RW primitives (writer priority) ---------- */
@@ -88,7 +93,7 @@ void log_read_unlock(server_log log) { reader_unlock(log); }
 void log_write_lock(server_log log)  { writer_lock(log); }
 void log_write_unlock(server_log log){ writer_unlock(log); }
 
-void log_writer_debug_sleep(server_log log)
+void log_debug_sleep(server_log log)
 {
     if (!log) return;
 
@@ -98,44 +103,34 @@ void log_writer_debug_sleep(server_log log)
     pthread_mutex_unlock(&log->mtx);
 
     if (s > 0) {
-        sleep((unsigned int)s);
+        unsigned remaining = (unsigned)s;
+        while (remaining) remaining = sleep(remaining);
     }
 }
 
-int get_log_locked(server_log log, char** dst)
+char *get_log_locked(server_log log, size_t *length)
 {
-    if (!log || !dst) return 0;
-
-    int out_len = (int)log->len;
-    char* copy = (char*)malloc((size_t)out_len + 1);
-    if (!copy) {
-        unix_error("malloc failed in get_log_locked");
+    char *copy = malloc(log->len + 1);
+    if (copy) {
+        memcpy(copy, log->buf, log->len + 1);
+        *length = log->len;
     }
-
-    if (out_len > 0) {
-        memcpy(copy, log->buf, (size_t)out_len);
-    }
-    copy[out_len] = '\0';
-
-    *dst = copy;
-    return out_len;
+    return copy;
 }
 
-void add_to_log_locked(server_log log, const char* data, int data_len)
+int add_to_log_locked(server_log log, const char *data, size_t length)
 {
-    if (!log || !data || data_len <= 0) return;
-
-    size_t new_len = log->len + (size_t)data_len;
-    ensure_capacity(log, new_len + 1);
-
-    memcpy(log->buf + log->len, data, (size_t)data_len);
-    log->len = new_len;
-    log->buf[log->len] = '\0';
+    if (length >= SIZE_MAX - log->len ||
+        ensure_capacity(log, log->len + length + 1) < 0) return -1;
+    memcpy(log->buf + log->len, data, length);
+    log->len += length;
+    log->buf[log->len] = 0;
+    return 0;
 }
 
 /* ---------- required API ---------- */
 
-server_log create_log()
+server_log create_log(void)
 {
     server_log log = (server_log)malloc(sizeof(struct Server_Log));
     if (!log) {
@@ -146,9 +141,12 @@ server_log create_log()
     log->len = 0;
     log->cap = 0;
 
-    pthread_mutex_init(&log->mtx, NULL);
-    pthread_cond_init(&log->can_read, NULL);
-    pthread_cond_init(&log->can_write, NULL);
+    int err = pthread_mutex_init(&log->mtx, NULL);
+    if (err) posix_error(err, "log mutex");
+    err = pthread_cond_init(&log->can_read, NULL);
+    if (err) posix_error(err, "reader condition");
+    err = pthread_cond_init(&log->can_write, NULL);
+    if (err) posix_error(err, "writer condition");
 
     log->active_readers = 0;
     log->active_writer = 0;
@@ -156,7 +154,7 @@ server_log create_log()
 
     log->debug_sleep_seconds = 0;
 
-    ensure_capacity(log, 1);
+    if (ensure_capacity(log, 1) < 0) unix_error("create_log");
     log->buf[0] = '\0';
 
     return log;
@@ -189,23 +187,3 @@ void set_log_debug_sleep(server_log log, int seconds)
     pthread_mutex_unlock(&log->mtx);
 }
 
-int get_log(server_log log, char** dst)
-{
-    if (!log || !dst) return 0;
-
-    reader_lock(log);
-    int n = get_log_locked(log, dst);
-    reader_unlock(log);
-
-    return n;
-}
-
-void add_to_log(server_log log, const char* data, int data_len)
-{
-    if (!log || !data || data_len <= 0) return;
-
-    writer_lock(log);
-    log_writer_debug_sleep(log);          // MUST be inside writer CS
-    add_to_log_locked(log, data, data_len);
-    writer_unlock(log);
-}

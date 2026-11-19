@@ -1,34 +1,31 @@
-#
-# To compile, type "make" or make "all"
-# To remove files, type "make clean"
-#
-
-OBJS = server.o request.o segel.o client.o log.o
-TARGET = server
-
-CC = gcc
-CFLAGS = -g -Wall
-
-LIBS = -lpthread
-
-.SUFFIXES: .c .o
-
-all: server client output.cgi
-	-mkdir -p public
-	-cp output.cgi favicon.ico home.html public
-
+CC ?= cc
+CFLAGS ?= -O2 -g
+CPPFLAGS += -D_GNU_SOURCE
+WARN = -std=c11 -Wall -Wextra -Wpedantic -Werror
+ifeq ($(shell uname -s),Darwin)
+CPPFLAGS += -D_DARWIN_C_SOURCE
+endif
+.PHONY: all clean test bench
+all: server client public/output.cgi public/home.html public/favicon.ico
 server: server.o request.o segel.o log.o
-	$(CC) $(CFLAGS) -o server server.o request.o segel.o log.o $(LIBS)
-
+	$(CC) $(CFLAGS) $(LDFLAGS) -pthread $^ -o $@
 client: client.o segel.o
-	$(CC) $(CFLAGS) -o client client.o segel.o
-
-output.cgi: output.c
-	$(CC) $(CFLAGS) -o output.cgi output.c
-
-.c.o:
-	$(CC) $(CFLAGS) -o $@ -c $<
-
+	$(CC) $(CFLAGS) $(LDFLAGS) -pthread $^ -o $@
+%.o: %.c
+	$(CC) $(CPPFLAGS) $(WARN) $(CFLAGS) -pthread -MMD -MP -c $< -o $@
+public:
+	mkdir -p $@
+public/output.cgi: output.c | public
+	$(CC) $(CPPFLAGS) $(WARN) $(CFLAGS) $(LDFLAGS) $< -o $@
+public/%: % | public
+	cp $< $@
+tests/monitor: tests/monitor.c log.c log.h segel.h segel.o
+	$(CC) $(CPPFLAGS) $(WARN) $(CFLAGS) $(LDFLAGS) -pthread tests/monitor.c segel.o -o $@
+test: all tests/monitor
+	./tests/monitor
+	python3 tests/integration.py
+bench: all
+	python3 bench/run.py
 clean:
-	-rm -f $(OBJS) server client output.cgi
-	-rm -rf public
+	rm -f *.o *.d server client tests/monitor public/output.cgi public/home.html public/favicon.ico
+-include $(wildcard *.d)

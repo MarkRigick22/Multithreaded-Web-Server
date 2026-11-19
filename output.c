@@ -1,60 +1,31 @@
-#include "segel.h"
-#include <sys/time.h>
-#include <assert.h>
-#include <unistd.h>
+// Course demo CGI: emit its headers and body on stdout and report elapsed time.
+#include <errno.h>
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
 
-
-//
-// This program is intended to help you test your web server.
-// You can use it to test that you are correctly having multiple threads
-// handling http requests.
-// 
-
-double spinfor = 5.0;
-
-void getargs()
+int main(void)
 {
-  char *buf, *p;
-
-  /* Extract the four arguments */
-  if ((buf = getenv("QUERY_STRING")) != NULL) {
-    p = strtok(buf, "&");
-    if (p == NULL) 
-      return;
-    spinfor = atof(p);
-    return;
-  }
+    const char *query = getenv("QUERY_STRING");
+    double delay = 5.0;
+    if (query && *query) {
+        char *end;
+        delay = strtod(query, &end);
+        if (end == query || (*end && *end != '&') || !isfinite(delay) ||
+            delay < 0 || delay > 60) return 1;
+    }
+    struct timespec start, finish;
+    struct timespec remaining = {(time_t)delay, (long)((delay - (time_t)delay) * 1e9)};
+    if (clock_gettime(CLOCK_MONOTONIC, &start)) return 1;
+    while (nanosleep(&remaining, &remaining) < 0) if (errno != EINTR) return 1;
+    if (clock_gettime(CLOCK_MONOTONIC, &finish)) return 1;
+    double elapsed = finish.tv_sec - start.tv_sec + (finish.tv_nsec - start.tv_nsec) / 1e9;
+    char content[256];
+    int n = snprintf(content, sizeof content, "<p>Welcome to the CGI program</p>\r\n"
+        "<p>My only purpose is to waste time on the server!</p>\r\n"
+        "<p>I spun for %.2f seconds</p>\r\n", elapsed);
+    if (n < 0 || (size_t)n >= sizeof content) return 1;
+    return printf("Content-length: %d\r\nContent-type: text/html\r\n\r\n%s", n, content) < 0;
 }
-
-double Time_GetSeconds() {
-    struct timeval t;
-    int rc = gettimeofday(&t, NULL);
-    assert(rc == 0);
-    return (double) ((double)t.tv_sec + (double)t.tv_usec / 1e6);
-}
-
-
-int main(int argc, char *argv[])
-{
-  char content[MAXBUF];
-
-  getargs();
-
-  double t1 = Time_GetSeconds();
-  usleep(spinfor * 1e6);
-  double t2 = Time_GetSeconds();
-
-  /* Make the response body */
-  sprintf(content, "<p>Welcome to the CGI program</p>\r\n");
-  sprintf(content, "%s<p>My only purpose is to waste time on the server!</p>\r\n", content);
-  sprintf(content, "%s<p>I spun for %.2f seconds</p>\r\n", content, t2 - t1);
-  
-  /* Generate the HTTP response */
-  printf("Content-length: %lu\r\n", strlen(content));
-  printf("Content-type: text/html\r\n\r\n");
-  printf("%s", content);
-  fflush(stdout);
-
-  exit(0);
-}
-

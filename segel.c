@@ -8,26 +8,26 @@
 void unix_error(char *msg) /* unix-style error */
 {
     fprintf(stderr, "%s: %s\n", msg, strerror(errno));
-    exit(0);
+    exit(EXIT_FAILURE);
 }
 /* $end unixerror */
 
 void posix_error(int code, char *msg) /* posix-style error */
 {
     fprintf(stderr, "%s: %s\n", msg, strerror(code));
-    exit(0);
+    exit(EXIT_FAILURE);
 }
 
 void dns_error(char *msg) /* dns-style error */
 {
     fprintf(stderr, "%s: DNS error %d\n", msg, h_errno);
-    exit(0);
+    exit(EXIT_FAILURE);
 }
 
 void app_error(char *msg) /* application error */
 {
     fprintf(stderr, "%s\n", msg);
-    exit(0);
+    exit(EXIT_FAILURE);
 }
 /* $end errorfuns */
 
@@ -347,7 +347,7 @@ static ssize_t rio_read(rio_t *rp, char *usrbuf, size_t n)
 
     /* Copy min(n, rp->rio_cnt) bytes from internal buf to user buf */
     cnt = n;          
-    if (rp->rio_cnt < n)   
+    if ((size_t)rp->rio_cnt < n)   
         cnt = rp->rio_cnt;
     memcpy(usrbuf, rp->rio_bufptr, cnt);
     rp->rio_bufptr += cnt;
@@ -400,7 +400,8 @@ ssize_t rio_readnb(rio_t *rp, void *usrbuf, size_t n)
 /* $begin rio_readlineb */
 ssize_t rio_readlineb(rio_t *rp, void *usrbuf, size_t maxlen) 
 {
-    int n, rc;
+    size_t n;
+    ssize_t rc;
     char c, *bufp = usrbuf;
 
     for (n = 1; n < maxlen; n++) { 
@@ -417,7 +418,7 @@ ssize_t rio_readlineb(rio_t *rp, void *usrbuf, size_t maxlen)
             return -1;    /* error */
     }
     *bufp = 0;
-    return n;
+    return bufp - (char *)usrbuf;
 }
 /* $end rio_readlineb */
 
@@ -435,7 +436,7 @@ ssize_t Rio_readn(int fd, void *ptr, size_t nbytes)
 
 void Rio_writen(int fd, void *usrbuf, size_t n) 
 {
-    if (rio_writen(fd, usrbuf, n) != n)
+    if (rio_writen(fd, usrbuf, n) != (ssize_t)n)
         unix_error("Rio_writen error");
 }
 
@@ -482,8 +483,10 @@ int open_clientfd(char *hostname, int port)
         return -1; /* check errno for cause of error */
 
     /* Fill in the server's IP address and port */
-    if ((hp = gethostbyname(hostname)) == NULL)
-        return -2; /* check h_errno for cause of error */
+    if ((hp = gethostbyname(hostname)) == NULL) {
+        close(clientfd);
+        return -2;
+    } /* check h_errno for cause of error */
     bzero((char *) &serveraddr, sizeof(serveraddr));
     serveraddr.sin_family = AF_INET;
     bcopy((char *)hp->h_addr, 
@@ -491,8 +494,10 @@ int open_clientfd(char *hostname, int port)
     serveraddr.sin_port = htons(port);
 
     /* Establish a connection with the server */
-    if (connect(clientfd, (SA *) &serveraddr, sizeof(serveraddr)) < 0)
+    if (connect(clientfd, (SA *) &serveraddr, sizeof(serveraddr)) < 0) {
+        close(clientfd);
         return -1;
+    }
     return clientfd;
 }
 /* $end open_clientfd */
@@ -516,7 +521,7 @@ int open_listenfd(int port)
     /* Eliminates "Address already in use" error from bind. */
     if (setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, 
                    (const void *)&optval , sizeof(int)) < 0) {
-      fprintf(stderr, "setsockopt failed\n");
+      close(listenfd);
       return -1;
     }
 
@@ -527,13 +532,13 @@ int open_listenfd(int port)
     serveraddr.sin_addr.s_addr = htonl(INADDR_ANY); 
     serveraddr.sin_port = htons((unsigned short)port); 
     if (bind(listenfd, (SA *)&serveraddr, sizeof(serveraddr)) < 0) {
-      fprintf(stderr, "bind failed\n");
+      close(listenfd);
       return -1;
     }
 
     /* Make it a listening socket ready to accept connection requests */
     if (listen(listenfd, LISTENQ) < 0) {
-      fprintf(stderr, "listen failed\n");
+      close(listenfd);
       return -1;
     }
     return listenfd;

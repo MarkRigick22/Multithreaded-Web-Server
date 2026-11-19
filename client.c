@@ -10,21 +10,20 @@
 #include "segel.h"
 
 // Sends an HTTP request to the server using the given socket
-void clientSend(int fd, char *filename, char* method)
+static void clientSend(int fd, char *filename, char* method, char *host)
 {
     char buf[MAXLINE];
-    char hostname[MAXLINE];
 
-    Gethostname(hostname, MAXLINE);
 
     // Use CRLF as required by HTTP
     // Keep filename as given (you can pass "/home.html" or "home.html")
-    snprintf(buf, sizeof(buf),
+    int length = snprintf(buf, sizeof(buf),
              "%s %s HTTP/1.1\r\n"
              "Host: %s\r\n"
              "Connection: close\r\n"
              "\r\n",
-             method, filename, hostname);
+             method, filename, host);
+    if (length < 0 || (size_t)length >= sizeof buf) app_error("Request too long");
 
     printf("Request:\n%s\n", buf);
 
@@ -47,11 +46,8 @@ void clientPrint(int fd)
         n = Rio_readlineb(&rio, buf, MAXBUF);
     }
 
-    // Print body (line-based; good enough for text/html and text/plain)
-    n = Rio_readlineb(&rio, buf, MAXBUF);
-    while (n > 0) {
-        printf("%s", buf);
-        n = Rio_readlineb(&rio, buf, MAXBUF);
+    while ((n = Rio_readnb(&rio, buf, sizeof buf)) > 0) {
+        if (fwrite(buf, 1, (size_t)n, stdout) != (size_t)n) unix_error("stdout");
     }
 }
 
@@ -66,7 +62,10 @@ int main(int argc, char *argv[])
     }
 
     host = argv[1];
-    port = atoi(argv[2]);
+    char *end;
+    long value = strtol(argv[2], &end, 10);
+    if (*end || value < 1 || value > 65535) app_error("Invalid port");
+    port = (int)value;
     filename = argv[3];
     method = argv[4];
 
@@ -76,7 +75,7 @@ int main(int argc, char *argv[])
         exit(1);
     }
 
-    clientSend(clientfd, filename, method);
+    clientSend(clientfd, filename, method, host);
     clientPrint(clientfd);
 
     Close(clientfd);
