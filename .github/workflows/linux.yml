@@ -1,0 +1,25 @@
+name: Linux validation
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {cc: gcc, flags: "-O2 -g"}
+          - {cc: clang, flags: "-O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined"}
+          - {cc: clang, flags: "-O1 -g -fno-omit-frame-pointer -fsanitize=thread"}
+    env:
+      CC: ${{ matrix.cc }}
+      CFLAGS: ${{ matrix.flags }}
+      ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+      TSAN_OPTIONS: halt_on_error=1
+    steps:
+      - uses: actions/checkout@v4
+      - run: make -j2 test
+      - run: python3 tests/integration.py Integration.test_parallel_snapshots
